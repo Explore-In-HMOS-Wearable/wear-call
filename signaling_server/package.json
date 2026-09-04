@@ -1,0 +1,13 @@
+{
+  "name": "harmony-call-signaling",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local signaling server for the HarmonyOS Call demo.",
+  "main": "signaling.js",
+  "scripts": {
+    "start": "node signaling.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Call Test Client</title>
+<style>
+  :root { --brand: #7360F2; --ink: #1C1B2E; --muted: #8A8798; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 20px; font: 15px/1.5 system-ui, sans-serif;
+    color: var(--ink); background: #F7F6FC;
+  }
+  main { max-width: 420px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.sub { color: var(--muted); margin: 0 0 24px; font-size: 13px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 14px 0 4px; }
+  input {
+    width: 100%; padding: 11px 13px; border: 1px solid #DDD9EE;
+    border-radius: 10px; font-size: 15px; background: #fff;
+  }
+  button {
+    width: 100%; padding: 13px; margin-top: 12px; border: 0; border-radius: 10px;
+    background: var(--brand); color: #fff; font-size: 15px; cursor: pointer;
+  }
+  button.ghost { background: #EDEAFB; color: var(--brand); }
+  button.danger { background: #E5484D; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  .row { display: flex; gap: 10px; }
+  .state {
+    margin-top: 20px; padding: 14px; border-radius: 10px;
+    background: #fff; border: 1px solid #E8E5F5; font-size: 14px;
+  }
+  .state b { display: block; font-size: 17px; margin-bottom: 2px; }
+  #log {
+    margin-top: 18px; font: 12px/1.6 ui-monospace, monospace; color: var(--muted);
+    background: #fff; border: 1px solid #E8E5F5; border-radius: 10px;
+    padding: 12px; height: 190px; overflow-y: auto; white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Call Test Client</h1>
+  <p class="sub">The other end of the app on your phone. If you only have one HarmonyOS device, use this as a second-party app.</p>
+
+  <label for="url">Server Adress</label>
+  <input id="url" value="ws://localhost:8080">
+
+  <label for="me">ID of this client</label>
+  <input id="me" value="c2">
+
+  <label for="peer">ID to call</label>
+  <input id="peer" value="c1">
+
+  <button id="connect">Connect</button>
+  <div class="row">
+    <button id="callBtn" class="ghost" disabled>Call</button>
+    <button id="acceptBtn" class="ghost" disabled>Answer the call</button>
+  </div>
+  <button id="hangupBtn" class="danger" disabled>Close</button>
+
+  <div class="state"><b id="stateText">Not connected</b><span id="stateSub">Enter the server address and connect.</span></div>
+  <div id="log"></div>
+</main>
+
+<script>
+// Same format as the AudioEngine in phones: 16 kHz, mono, 16-bit little-endian.
+const RATE = 16000;
+// ScriptProcessor only accepts buffers that are powers of 2 (256..16384).
+// 512 samples @ 16 kHz ≈ 32 ms. The phone side doesn't expect a fixed size, so it won't be a problem.
+const FRAME = 512;
+
+let ws = null, ctx = null, micNode = null, procNode = null, stream = null;
+let playHead = 0, inCall = false;
+
+const $ = (id) => document.getElementById(id);
+const log = (m) => {
+  const el = $('log');
+  el.textContent += new Date().toLocaleTimeString('tr-TR') + '  ' + m + '\n';
+  el.scrollTop = el.scrollHeight;
+};
+const setState = (title, sub) => { $('stateText').textContent = title; $('stateSub').textContent = sub; };
+const send = (o) => ws && ws.readyState === 1 && ws.send(JSON.stringify(o));
+
+$('connect').onclick = () => {
+  ws = new WebSocket($('url').value);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    send({ t: 'hello', id: $('me').value, name: 'Browser Client' });
+    setState('Connected', 'You can make a call or wait.');
+    $('callBtn').disabled = false;
+    log('Connected to the server');
+  };
+
+  ws.onmessage = async (ev) => {
+    if (ev.data instanceof ArrayBuffer) { playPcm(ev.data); return; }
+    const m = JSON.parse(ev.data);
+    log('← ' + m.t);
+    if (m.t === 'invite') {
+      setState('Incoming call', (m.name || m.from) + ' arıyor');
+      $('acceptBtn').disabled = false;
+      $('hangupBtn').disabled = false;
+    } else if (m.t === 'ringing') {
+      setState('Calling...', 'Ringing');
+    } else if (m.t === 'accept') {
+      setState('Talking', 'Microphone is on');
+      await startAudio();
+    } else if (m.t === 'reject' || m.t === 'bye' || m.t === 'unavailable') {
+      setState('Call finished', m.reason ? 'Reason: ' + m.reason : 'Line off');
+      stopAudio();
+    }
+  };
+
+  ws.onclose = () => { setState('Connection closed', 'Reconnect'); stopAudio(); resetButtons(); };
+  ws.onerror = () => log('Connection error - check address and firewall.');
+};
+
+$('callBtn').onclick = () => {
+  send({ t: 'invite', to: $('peer').value, name: 'Browser Client' });
+  setState('Calling', $('peer').value);
+  $('hangupBtn').disabled = false;
+};
+
+$('acceptBtn').onclick = async () => {
+  send({ t: 'accept' });
+  $('acceptBtn').disabled = true;
+  setState('Talking', 'Microphone on');
+  await startAudio();
+};
+
+$('hangupBtn').onclick = () => { send({ t: 'bye' }); stopAudio(); setState('Closed', ''); resetButtons(); };
+
+function resetButtons() {
+  $('acceptBtn').disabled = true;
+  $('hangupBtn').disabled = true;
+  $('callBtn').disabled = !(ws && ws.readyState === 1);
+}
+
+async function startAudio() {
+  if (inCall) {
+  return;
+  }
+  inCall = true;
+  ctx = new AudioContext({ sampleRate: RATE });
+  playHead = ctx.currentTime;
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 }
+  });
+  micNode = ctx.createMediaStreamSource(stream);
+  procNode = ctx.createScriptProcessor(FRAME, 1, 1);
+  procNode.onaudioprocess = (e) => {
+    if (!ws || ws.readyState !== 1) {
+      return;
+    }
+    const f32 = e.inputBuffer.getChannelData(0);
+    const i16 = new Int16Array(f32.length);
+    for (let i = 0; i < f32.length; i++) {
+      const s = Math.max(-1, Math.min(1, f32[i]));
+      i16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    ws.send(i16.buffer);
+  };
+  micNode.connect(procNode);
+  procNode.connect(ctx.destination);
+  log('mikrofon açıldı');
+}
+
+function playPcm(buf) {
+  if (!ctx) {
+    return;
+  }
+  const i16 = new Int16Array(buf);
+  const audioBuf = ctx.createBuffer(1, i16.length, RATE);
+  const ch = audioBuf.getChannelData(0);
+  for (let i = 0; i < i16.length; i++) {
+    ch[i] = i16[i] / 0x8000;
+  }
+  const src = ctx.createBufferSource();
+  src.buffer = audioBuf;
+  src.connect(ctx.destination);
+  const now = ctx.currentTime;
+  if (playHead < now + 0.02) {
+    playHead = now + 0.02;
+  }
+  src.start(playHead);
+  playHead += audioBuf.duration;
+}
+
+function stopAudio() {
+  inCall = false;
+  if (procNode) { procNode.disconnect(); procNode.onaudioprocess = null; procNode = null; }
+  if (micNode) { micNode.disconnect(); micNode = null; }
+  if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+  if (ctx) { ctx.close(); ctx = null; }
+}
+</script>
+</body>
+</html>
